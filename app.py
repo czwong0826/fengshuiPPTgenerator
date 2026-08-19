@@ -18,10 +18,8 @@ st.title("🏠 风水报告生成器（原型）")
 st.caption("在左侧选择需要分析的区域，上传平面图并点击打点，然后在下方对应面板中填写细节，最后点击底部按钮生成 JSON 数据或 PPT 文件。")
 
 # ---------- 1. 侧边栏多选框 ----------
-AREA_OPTIONS = [
-    "大门", "客厅", "饭厅", "干厨房", "湿厨房",
-    "主卧", "未来儿子房", "未来女儿房", "卫生间",
-]
+# 直接从知识库的 key 动态生成，避免"知识库加了新区域、侧边栏却忘记同步"的问题
+AREA_OPTIONS = list(ROOM_KNOWLEDGE_BASE.keys())
 
 with st.sidebar:
     st.header("选择区域")
@@ -90,6 +88,56 @@ else:
 
 st.markdown("---")
 
+
+# ---------- 渲染单个知识库条目（普通 checkbox 或 主选项+子选项） ----------
+def render_knowledge_item(area: str, idx: int, item):
+    """渲染一个条目。普通字符串直接渲染 checkbox；dict 类型（选择型条目）
+    渲染 checkbox + 子选项（单选/多选），返回勾选后拼好的最终文案；
+    未勾选或子选项未选完整时返回 None。
+    """
+    if isinstance(item, str):
+        checked = st.checkbox(item, key=f"{area}_checkbox_{idx}")
+        return item if checked else None
+
+    # 选择型条目
+    checked = st.checkbox(item["label"], key=f"{area}_mainchk_{idx}")
+    if not checked:
+        return None
+
+    values = {}
+    all_filled = True
+    with st.container():
+        for group_key, group_cfg in item["choices"].items():
+            options = group_cfg["options"]
+            if group_cfg["multi"]:
+                selected = st.multiselect(
+                    f"　↳ 请选择具体内容",
+                    options=options,
+                    key=f"{area}_subms_{idx}_{group_key}",
+                )
+                if not selected:
+                    all_filled = False
+                else:
+                    values[group_key] = "、".join(selected)
+            else:
+                selected = st.radio(
+                    f"　↳ 请选择具体内容",
+                    options=options,
+                    key=f"{area}_subradio_{idx}_{group_key}",
+                    index=None,
+                )
+                if selected is None:
+                    all_filled = False
+                else:
+                    values[group_key] = selected
+
+    if not all_filled:
+        st.caption("⚠️ 请完成上方子选项的选择，否则该项不会计入报告")
+        return None
+
+    return item["template"].format(**values)
+
+
 # ---------- 3 & 4. 动态生成折叠面板 ----------
 report_data = {}
 
@@ -104,9 +152,9 @@ else:
             current_area_items = ROOM_KNOWLEDGE_BASE.get(area, ["保持整洁通风", "注意采光"])
 
             for idx, item in enumerate(current_area_items):
-                checked = st.checkbox(item, key=f"{area}_checkbox_{idx}")
-                if checked:
-                    checked_items.append(item)
+                result_text = render_knowledge_item(area, idx, item)
+                if result_text:
+                    checked_items.append(result_text)
 
             note = st.text_area(
                 "额外备注",
