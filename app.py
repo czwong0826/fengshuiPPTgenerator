@@ -1,5 +1,6 @@
 import io
 import json
+import uuid
 
 import streamlit as st
 from PIL import Image
@@ -15,21 +16,78 @@ from knowledge_base import ROOM_KNOWLEDGE_BASE
 st.set_page_config(page_title="风水报告生成器", layout="wide")
 
 st.title("🏠 风水报告生成器（原型）")
-st.caption("在左侧选择需要分析的区域，上传平面图并点击打点，然后在下方对应面板中填写细节，最后点击底部按钮生成 JSON 数据或 PPT 文件。")
+st.caption("在左侧添加需要分析的区域（支持同类型多个实例，如厕所A/厕所B），上传平面图并点击打点，然后在下方填写细节，最后生成 JSON 数据或 PPT 文件。")
 
-# ---------- 1. 侧边栏多选框 ----------
-# 直接从知识库的 key 动态生成，避免"知识库加了新区域、侧边栏却忘记同步"的问题
-AREA_OPTIONS = list(ROOM_KNOWLEDGE_BASE.keys())
+CUSTOM_TYPE = "自定义区域"
+# 房间类型列表：知识库里的所有类型 + 一个"自定义区域"（无预设选项，只能写备注）
+ROOM_TYPE_OPTIONS = list(ROOM_KNOWLEDGE_BASE.keys()) + [CUSTOM_TYPE]
 
+# ---------- session_state 初始化 ----------
+# instances: 已添加的区域实例列表，每项是 {"id": 唯一ID, "type": 房间类型, "name": 显示名称}
+# area_coordinates: 打点坐标，key 是实例的唯一 ID（不是名字！同名/同类型实例也不会互相覆盖）
+st.session_state.setdefault("instances", [])
+st.session_state.setdefault("area_coordinates", {})
+# 用递增计数器给"添加区域"表单里的控件生成新 key，强制它们在每次提交后
+# 重新以默认值渲染（相当于手动实现清空效果，不依赖 clear_on_submit）
+st.session_state.setdefault("add_form_version", 0)
+
+
+def generate_default_name(room_type: str) -> str:
+    """同类型自动编号：卫生间 1、卫生间 2……自定义区域默认叫"未命名区域 N"。"""
+    base = "未命名区域" if room_type == CUSTOM_TYPE else room_type
+    count = sum(1 for inst in st.session_state["instances"] if inst["type"] == room_type)
+    return f"{base} {count + 1}"
+
+
+# ---------- 1. 侧边栏：添加 / 管理区域实例 ----------
 with st.sidebar:
-    st.header("选择区域")
-    selected_areas = st.multiselect(
-        "请选择需要分析的区域",
-        options=AREA_OPTIONS,
-        default=[],
-    )
+    st.header("➕ 添加区域")
+
+    form_version = st.session_state["add_form_version"]
+    with st.form("add_area_form", clear_on_submit=True):
+        selected_type = st.selectbox(
+            "房间类型", options=ROOM_TYPE_OPTIONS, key=f"new_area_type_{form_version}"
+        )
+        custom_name = st.text_input(
+            "显示名称（可选，留空自动编号）",
+            placeholder="例如：厕所 A",
+            key=f"new_area_name_{form_version}",
+        )
+        submitted = st.form_submit_button("添加区域", use_container_width=True)
+
+        if submitted:
+            final_name = custom_name.strip() or generate_default_name(selected_type)
+            st.session_state["instances"].append(
+                {
+                    "id": uuid.uuid4().hex[:8],
+                    "type": selected_type,
+                    "name": final_name,
+                }
+            )
+            st.session_state["add_form_version"] += 1
+            st.toast(f"已添加「{final_name}」")
+            st.rerun()
+
     st.markdown("---")
-    st.caption(f"已选择 {len(selected_areas)} 个区域")
+    st.subheader("已添加区域")
+
+    if not st.session_state["instances"]:
+        st.caption("尚未添加任何区域，请使用上方表单添加。")
+    else:
+        for inst in list(st.session_state["instances"]):
+            col1, col2 = st.columns([4, 1])
+            col1.write(f"📍 **{inst['name']}**　`{inst['type']}`")
+            if col2.button("🗑️", key=f"del_{inst['id']}", help="删除该区域"):
+                st.session_state["instances"] = [
+                    i for i in st.session_state["instances"] if i["id"] != inst["id"]
+                ]
+                st.session_state["area_coordinates"].pop(inst["id"], None)
+                st.rerun()
+
+    st.markdown("---")
+    st.caption(f"共 {len(st.session_state['instances'])} 个区域")
+
+instances = st.session_state["instances"]
 
 # ---------- 2. 平面图上传 + 点击打点 ----------
 st.subheader("🗺️ 平面图打点标注")
@@ -40,67 +98,74 @@ floor_plan_bytes = None
 img_width = None
 img_height = None
 
-# session_state 用于跨 rerun 持久化每个区域的打点坐标
-# （report_data 每次都是在下方循环里重新构建的，坐标必须单独存起来再合并进去）
-st.session_state.setdefault("area_coordinates", {})
-
 if uploaded_image is not None:
     floor_plan_bytes = uploaded_image.getvalue()
     pil_image = Image.open(io.BytesIO(floor_plan_bytes))
     img_width, img_height = pil_image.size
 
-    if not selected_areas:
-        st.info("请先在左侧边栏至少选择一个区域，才能在图上为其打点。")
+    if not instances:
+        st.info("请先在左侧添加至少一个区域，才能在图上为其打点。")
     else:
-        target_area = st.selectbox(
+        # 下拉框展示"显示名称"，但实际选中值是实例的唯一 ID
+        target_instance_id = st.selectbox(
             "选择要标注的区域（点击下方图片即可为该区域记录坐标）",
-            options=selected_areas,
-            key="target_area_for_click",
+            options=[inst["id"] for inst in instances],
+            format_func=lambda iid: next(
+                (i["name"] for i in instances if i["id"] == iid), iid
+            ),
+            key="target_instance_for_click",
         )
+        target_name = next(i["name"] for i in instances if i["id"] == target_instance_id)
 
-        st.caption(f"图片原始尺寸：{img_width} × {img_height} px。点击图片，将为「{target_area}」记录打点位置。")
+        st.caption(f"图片原始尺寸：{img_width} × {img_height} px。点击图片，将为「{target_name}」记录打点位置。")
 
         coords = streamlit_image_coordinates(pil_image, key="floor_plan_coords")
 
         if coords is not None:
             # streamlit_image_coordinates 会在没有新点击时持续返回上一次的坐标，
-            # 用签名比较判断这是不是一次“新”点击，避免每次 rerun 都覆盖当前选中的区域
+            # 用签名比较判断这是不是一次"新"点击，避免每次 rerun 都覆盖当前选中的目标区域
             coord_signature = (coords["x"], coords["y"])
             if st.session_state.get("last_coord_signature") != coord_signature:
                 st.session_state["last_coord_signature"] = coord_signature
-                st.session_state["area_coordinates"][target_area] = {
+                st.session_state["area_coordinates"][target_instance_id] = {
                     "x": coords["x"],
                     "y": coords["y"],
                     "width": img_width,
                     "height": img_height,
                 }
-                st.success(f"已记录「{target_area}」的坐标：({coords['x']}, {coords['y']})")
+                st.success(f"已记录「{target_name}」的坐标：({coords['x']}, {coords['y']})")
 
         if st.session_state["area_coordinates"]:
             with st.expander("📌 已记录的坐标一览", expanded=False):
-                st.json(st.session_state["area_coordinates"])
+                # 展示时把 ID 换成人类可读的名字
+                readable = {
+                    next((i["name"] for i in instances if i["id"] == iid), iid): coord
+                    for iid, coord in st.session_state["area_coordinates"].items()
+                }
+                st.json(readable)
                 if st.button("清空所有坐标"):
                     st.session_state["area_coordinates"] = {}
                     st.session_state.pop("last_coord_signature", None)
                     st.rerun()
 else:
-    st.info("上传平面图后，可在图上为每个已选区域点击打点。")
+    st.info("上传平面图后，可在图上为每个已添加区域点击打点。")
 
 st.markdown("---")
 
 
 # ---------- 渲染单个知识库条目（普通 checkbox 或 主选项+子选项） ----------
-def render_knowledge_item(area: str, idx: int, item):
-    """渲染一个条目。普通字符串直接渲染 checkbox；dict 类型（选择型条目）
-    渲染 checkbox + 子选项（单选/多选），返回勾选后拼好的最终文案；
-    未勾选或子选项未选完整时返回 None。
+def render_knowledge_item(instance_id: str, idx: int, item):
+    """渲染一个条目。key 前缀一律使用实例的唯一 ID，
+    避免同类型/同名的多个实例互相覆盖彼此的勾选状态。
+    普通字符串直接渲染 checkbox；dict 类型（选择型条目）渲染 checkbox + 子选项
+    （单选/多选），返回勾选后拼好的最终文案；未勾选或子选项未选完整时返回 None。
     """
     if isinstance(item, str):
-        checked = st.checkbox(item, key=f"{area}_checkbox_{idx}")
+        checked = st.checkbox(item, key=f"{instance_id}_checkbox_{idx}")
         return item if checked else None
 
     # 选择型条目
-    checked = st.checkbox(item["label"], key=f"{area}_mainchk_{idx}")
+    checked = st.checkbox(item["label"], key=f"{instance_id}_mainchk_{idx}")
     if not checked:
         return None
 
@@ -111,9 +176,9 @@ def render_knowledge_item(area: str, idx: int, item):
             options = group_cfg["options"]
             if group_cfg["multi"]:
                 selected = st.multiselect(
-                    f"　↳ 请选择具体内容",
+                    "　↳ 请选择具体内容",
                     options=options,
-                    key=f"{area}_subms_{idx}_{group_key}",
+                    key=f"{instance_id}_subms_{idx}_{group_key}",
                 )
                 if not selected:
                     all_filled = False
@@ -121,9 +186,9 @@ def render_knowledge_item(area: str, idx: int, item):
                     values[group_key] = "、".join(selected)
             else:
                 selected = st.radio(
-                    f"　↳ 请选择具体内容",
+                    "　↳ 请选择具体内容",
                     options=options,
-                    key=f"{area}_subradio_{idx}_{group_key}",
+                    key=f"{instance_id}_subradio_{idx}_{group_key}",
                     index=None,
                 )
                 if selected is None:
@@ -138,40 +203,51 @@ def render_knowledge_item(area: str, idx: int, item):
     return item["template"].format(**values)
 
 
-# ---------- 3 & 4. 动态生成折叠面板 ----------
+# ---------- 3. 动态生成折叠面板（遍历区域实例） ----------
+# report_data 用实例 ID 做 key，避免同名/同类型区域互相覆盖
 report_data = {}
 
-if not selected_areas:
-    st.info("请先在左侧边栏选择至少一个区域，下方将自动生成对应的填写面板。")
+if not instances:
+    st.info("请先在左侧添加至少一个区域，下方将自动生成对应的填写面板。")
 else:
     st.subheader("区域详情填写")
-    for area in selected_areas:
-        with st.expander(f"📍 {area}", expanded=True):
+    for inst in instances:
+        instance_id = inst["id"]
+        area_type = inst["type"]
+        area_name = inst["name"]
+
+        with st.expander(f"📍 {area_name}", expanded=True):
             checked_items = []
-            # 获取当前区域对应的选项，如果没有匹配到，则提供通用选项
-            current_area_items = ROOM_KNOWLEDGE_BASE.get(area, ["保持整洁通风", "注意采光"])
+            # 知识库里查不到该类型（自定义区域，或知识库以外的类型）就返回空列表，
+            # 折叠面板里只剩备注框和打点信息，不报错
+            current_area_items = ROOM_KNOWLEDGE_BASE.get(area_type, [])
+
+            if not current_area_items:
+                st.caption("（该区域无预设勾选项，可在下方直接填写备注）")
 
             for idx, item in enumerate(current_area_items):
-                result_text = render_knowledge_item(area, idx, item)
+                result_text = render_knowledge_item(instance_id, idx, item)
                 if result_text:
                     checked_items.append(result_text)
 
             note = st.text_area(
                 "额外备注",
-                key=f"{area}_note",
-                placeholder=f"请输入针对「{area}」的额外说明...",
+                key=f"{instance_id}_note",
+                placeholder=f"请输入针对「{area_name}」的额外说明...",
                 height=100,
             )
 
-            report_data[area] = {
+            report_data[instance_id] = {
+                "名称": area_name,
+                "类型": area_type,
                 "已勾选项": checked_items,
                 "备注": note,
             }
 
             # 把该区域记录的打点坐标合并进 report_data
-            if area in st.session_state["area_coordinates"]:
-                coord = st.session_state["area_coordinates"][area]
-                report_data[area]["坐标"] = coord
+            if instance_id in st.session_state["area_coordinates"]:
+                coord = st.session_state["area_coordinates"][instance_id]
+                report_data[instance_id]["坐标"] = coord
                 st.caption(f"📌 已标注坐标：({coord['x']}, {coord['y']})")
 
 st.markdown("---")
@@ -179,14 +255,15 @@ st.markdown("---")
 
 # ---------- PPTX 生成函数 ----------
 def build_pptx(
-    data: dict,
+    area_reports: list,
     floor_plan_bytes: bytes = None,
     img_width: int = None,
     img_height: int = None,
 ) -> bytes:
-    """遍历 report_data，为每个区域生成一页幻灯片：
+    """遍历区域实例列表，为每个实例生成一页幻灯片：
     左侧放文本内容（勾选项 + 备注），右侧放平面图，
     如果该区域记录了打点坐标，就在图上对应位置画一个红色圆点。
+    幻灯片标题使用『显示名称』，同类型的多个实例（如厕所A/厕所B）会各自独立成页。
     """
     prs = Presentation()
     title_and_content_layout = prs.slide_layouts[1]
@@ -197,13 +274,14 @@ def build_pptx(
     IMG_BOX_MAX_WIDTH = Inches(4.2)
     IMG_BOX_MAX_HEIGHT = Inches(5.3)
 
-    for area, content in data.items():
-        checked_items = content.get("已勾选项", [])
-        note = content.get("备注", "").strip()
-        coord = content.get("坐标")
+    for report in area_reports:
+        area_name = report.get("名称", "未命名区域")
+        checked_items = report.get("已勾选项", [])
+        note = report.get("备注", "").strip()
+        coord = report.get("坐标")
 
         slide = prs.slides.add_slide(title_and_content_layout)
-        slide.shapes.title.text = area
+        slide.shapes.title.text = area_name
 
         # ---- 左侧：文本框（勾选项 + 备注） ----
         body_placeholder = slide.placeholders[1]
@@ -300,18 +378,18 @@ def build_pptx(
     return buffer.getvalue()
 
 
-# ---------- 5. 生成 JSON 数据 / PPT 文件 ----------
+# ---------- 4. 生成 JSON 数据 / PPT 文件 ----------
 col1, col2 = st.columns(2)
+
+# 按实例添加顺序整理成列表（而不是用不透明的 UUID 做 key 展示给用户）
+ordered_reports = [report_data[inst["id"]] for inst in instances if inst["id"] in report_data]
 
 with col1:
     if st.button("生成 JSON 数据", type="primary", use_container_width=True):
-        if not selected_areas:
-            st.warning("尚未选择任何区域，无法生成报告。")
+        if not instances:
+            st.warning("尚未添加任何区域，无法生成报告。")
         else:
-            final_output = {
-                "选择的区域": selected_areas,
-                "详情": report_data,
-            }
+            final_output = {"区域列表": ordered_reports}
             st.success("JSON 数据生成成功！")
             st.json(final_output)
 
@@ -325,11 +403,11 @@ with col1:
 
 with col2:
     if st.button("生成 PPT", type="secondary", use_container_width=True):
-        if not selected_areas:
-            st.warning("尚未选择任何区域，无法生成报告。")
+        if not instances:
+            st.warning("尚未添加任何区域，无法生成报告。")
         else:
             pptx_bytes = build_pptx(
-                report_data,
+                ordered_reports,
                 floor_plan_bytes=floor_plan_bytes,
                 img_width=img_width,
                 img_height=img_height,

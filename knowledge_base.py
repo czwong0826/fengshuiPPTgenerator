@@ -85,8 +85,8 @@ BEDROOM_OPTIONS = [
 
 ROOM_KNOWLEDGE_BASE = {
     "主卧": BEDROOM_OPTIONS,
-    "未来儿子房": BEDROOM_OPTIONS,
-    "未来女儿房": BEDROOM_OPTIONS,
+    "儿子房": BEDROOM_OPTIONS,
+    "女儿房": BEDROOM_OPTIONS,
     "父母房": BEDROOM_OPTIONS,
     "客房": BEDROOM_OPTIONS,
 
@@ -130,7 +130,7 @@ ROOM_KNOWLEDGE_BASE = {
         "需安裝抽風機把晦氣排出屋外",
     ],
 
-    "湿厨房": [  # 在源文件中标记为"灶"
+    "灶": [
         "後方不能懸空或窗口設計，灶需背靠实墙",
         "水火必須一樣高度，距離最少3尺以上",
         "灶爐上廚忌用\u201c黑、灰、藍、紅、粉紅、紫、橙色\u201d；建議\u201c白、青、木褐色\u201d",
