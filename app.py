@@ -1,6 +1,6 @@
 import io
-import json
 import uuid
+import json
 
 import streamlit as st
 from PIL import Image
@@ -8,163 +8,66 @@ from streamlit_image_coordinates import streamlit_image_coordinates
 
 from pptx import Presentation
 from pptx.util import Inches, Pt
-from pptx.enum.shapes import MSO_SHAPE
+from pptx.enum.shapes import MSO_SHAPE, MSO_CONNECTOR
+from pptx.enum.dml import MSO_LINE_DASH_STYLE
+from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE, MSO_ANCHOR
 from pptx.dml.color import RGBColor
+from pptx.oxml.ns import qn
 
 from knowledge_base import ROOM_KNOWLEDGE_BASE
 
 st.set_page_config(page_title="风水报告生成器", layout="wide")
 
 st.title("🏠 风水报告生成器（原型）")
-st.caption("在左侧添加需要分析的区域（支持同类型多个实例，如厕所A/厕所B），上传平面图并点击打点，然后在下方填写细节，最后生成 JSON 数据或 PPT 文件。")
+st.caption(
+    "按楼层来做：上传一张平面图，添加这一层的区域并打点、勾选内容，"
+    "完成后点「➕ 添加新楼层」标签页继续下一层。全部做完后在页面底部生成 PPT / JSON。"
+)
 
 CUSTOM_TYPE = "自定义区域"
-# 房间类型列表：知识库里的所有类型 + 一个"自定义区域"（无预设选项，只能写备注）
 ROOM_TYPE_OPTIONS = list(ROOM_KNOWLEDGE_BASE.keys()) + [CUSTOM_TYPE]
 
 # ---------- session_state 初始化 ----------
-# instances: 已添加的区域实例列表，每项是 {"id": 唯一ID, "type": 房间类型, "name": 显示名称}
-# area_coordinates: 打点坐标，key 是实例的唯一 ID（不是名字！同名/同类型实例也不会互相覆盖）
-st.session_state.setdefault("instances", [])
-st.session_state.setdefault("area_coordinates", {})
-# 用递增计数器给"添加区域"表单里的控件生成新 key，强制它们在每次提交后
-# 重新以默认值渲染（相当于手动实现清空效果，不依赖 clear_on_submit）
-st.session_state.setdefault("add_form_version", 0)
+# floors：每个元素是一个"楼层"，楼层=一张图纸+挂在它上面的区域们，彼此完全独立：
+#   {
+#     "id": 楼层唯一ID,
+#     "name": 楼层名称（如"底楼"）,
+#     "image_bytes": 图片字节, "image_name": 文件名,
+#     "image_width": 原始宽度, "image_height": 原始高度,
+#     "instances": [ {"id":, "type":, "name":}, ... ],   # 这一层的区域实例
+#     "coordinates": { instance_id: {"x":, "y":} },       # 该区域在这层图纸上的打点坐标
+#     "add_area_form_version": 表单版本号（清空表单用）,
+#   }
+st.session_state.setdefault("floors", [])
+st.session_state.setdefault("add_floor_form_version", 0)
+st.session_state.setdefault("last_click_sig", {})  # 楼层ID -> 上一次点击签名，防止重复记录
+
+
+def all_instances():
+    """把所有楼层的区域实例拉平成一个列表，用于全局唯一命名计数。"""
+    result = []
+    for floor in st.session_state["floors"]:
+        result.extend(floor["instances"])
+    return result
 
 
 def generate_default_name(room_type: str) -> str:
-    """同类型自动编号：卫生间 1、卫生间 2……自定义区域默认叫"未命名区域 N"。"""
+    """全局统一编号：不分楼层，第一个叫"卫生间"，第二个（不管在哪层）叫"卫生间 2"……
+    这样方便用户在各处下拉框里凭名字分辨，不会重名混淆。
+    """
     base = "未命名区域" if room_type == CUSTOM_TYPE else room_type
-    count = sum(1 for inst in st.session_state["instances"] if inst["type"] == room_type)
+    count = sum(1 for inst in all_instances() if inst["type"] == room_type)
+    if count == 0:
+        return base
     return f"{base} {count + 1}"
 
 
-# ---------- 1. 侧边栏：添加 / 管理区域实例 ----------
-with st.sidebar:
-    st.header("➕ 添加区域")
-
-    form_version = st.session_state["add_form_version"]
-    with st.form("add_area_form", clear_on_submit=True):
-        selected_type = st.selectbox(
-            "房间类型", options=ROOM_TYPE_OPTIONS, key=f"new_area_type_{form_version}"
-        )
-        custom_name = st.text_input(
-            "显示名称（可选，留空自动编号）",
-            placeholder="例如：厕所 A",
-            key=f"new_area_name_{form_version}",
-        )
-        submitted = st.form_submit_button("添加区域", use_container_width=True)
-
-        if submitted:
-            final_name = custom_name.strip() or generate_default_name(selected_type)
-            st.session_state["instances"].append(
-                {
-                    "id": uuid.uuid4().hex[:8],
-                    "type": selected_type,
-                    "name": final_name,
-                }
-            )
-            st.session_state["add_form_version"] += 1
-            st.toast(f"已添加「{final_name}」")
-            st.rerun()
-
-    st.markdown("---")
-    st.subheader("已添加区域")
-
-    if not st.session_state["instances"]:
-        st.caption("尚未添加任何区域，请使用上方表单添加。")
-    else:
-        for inst in list(st.session_state["instances"]):
-            col1, col2 = st.columns([4, 1])
-            col1.write(f"📍 **{inst['name']}**　`{inst['type']}`")
-            if col2.button("🗑️", key=f"del_{inst['id']}", help="删除该区域"):
-                st.session_state["instances"] = [
-                    i for i in st.session_state["instances"] if i["id"] != inst["id"]
-                ]
-                st.session_state["area_coordinates"].pop(inst["id"], None)
-                st.rerun()
-
-    st.markdown("---")
-    st.caption(f"共 {len(st.session_state['instances'])} 个区域")
-
-instances = st.session_state["instances"]
-
-# ---------- 2. 平面图上传 + 点击打点 ----------
-st.subheader("🗺️ 平面图打点标注")
-
-uploaded_image = st.file_uploader("上传平面图（用于标注各区域位置）", type=["png", "jpg", "jpeg"])
-
-floor_plan_bytes = None
-img_width = None
-img_height = None
-
-if uploaded_image is not None:
-    floor_plan_bytes = uploaded_image.getvalue()
-    pil_image = Image.open(io.BytesIO(floor_plan_bytes))
-    img_width, img_height = pil_image.size
-
-    if not instances:
-        st.info("请先在左侧添加至少一个区域，才能在图上为其打点。")
-    else:
-        # 下拉框展示"显示名称"，但实际选中值是实例的唯一 ID
-        target_instance_id = st.selectbox(
-            "选择要标注的区域（点击下方图片即可为该区域记录坐标）",
-            options=[inst["id"] for inst in instances],
-            format_func=lambda iid: next(
-                (i["name"] for i in instances if i["id"] == iid), iid
-            ),
-            key="target_instance_for_click",
-        )
-        target_name = next(i["name"] for i in instances if i["id"] == target_instance_id)
-
-        st.caption(f"图片原始尺寸：{img_width} × {img_height} px。点击图片，将为「{target_name}」记录打点位置。")
-
-        coords = streamlit_image_coordinates(pil_image, key="floor_plan_coords")
-
-        if coords is not None:
-            # streamlit_image_coordinates 会在没有新点击时持续返回上一次的坐标，
-            # 用签名比较判断这是不是一次"新"点击，避免每次 rerun 都覆盖当前选中的目标区域
-            coord_signature = (coords["x"], coords["y"])
-            if st.session_state.get("last_coord_signature") != coord_signature:
-                st.session_state["last_coord_signature"] = coord_signature
-                st.session_state["area_coordinates"][target_instance_id] = {
-                    "x": coords["x"],
-                    "y": coords["y"],
-                    "width": img_width,
-                    "height": img_height,
-                }
-                st.success(f"已记录「{target_name}」的坐标：({coords['x']}, {coords['y']})")
-
-        if st.session_state["area_coordinates"]:
-            with st.expander("📌 已记录的坐标一览", expanded=False):
-                # 展示时把 ID 换成人类可读的名字
-                readable = {
-                    next((i["name"] for i in instances if i["id"] == iid), iid): coord
-                    for iid, coord in st.session_state["area_coordinates"].items()
-                }
-                st.json(readable)
-                if st.button("清空所有坐标"):
-                    st.session_state["area_coordinates"] = {}
-                    st.session_state.pop("last_coord_signature", None)
-                    st.rerun()
-else:
-    st.info("上传平面图后，可在图上为每个已添加区域点击打点。")
-
-st.markdown("---")
-
-
-# ---------- 渲染单个知识库条目（普通 checkbox 或 主选项+子选项） ----------
+# ---------- 渲染单个知识库条目（普通 checkbox 或 主选项+子选项），与原版逻辑一致 ----------
 def render_knowledge_item(instance_id: str, idx: int, item):
-    """渲染一个条目。key 前缀一律使用实例的唯一 ID，
-    避免同类型/同名的多个实例互相覆盖彼此的勾选状态。
-    普通字符串直接渲染 checkbox；dict 类型（选择型条目）渲染 checkbox + 子选项
-    （单选/多选），返回勾选后拼好的最终文案；未勾选或子选项未选完整时返回 None。
-    """
     if isinstance(item, str):
         checked = st.checkbox(item, key=f"{instance_id}_checkbox_{idx}")
         return item if checked else None
 
-    # 选择型条目
     checked = st.checkbox(item["label"], key=f"{instance_id}_mainchk_{idx}")
     if not checked:
         return None
@@ -203,25 +106,117 @@ def render_knowledge_item(instance_id: str, idx: int, item):
     return item["template"].format(**values)
 
 
-# ---------- 3. 动态生成折叠面板（遍历区域实例） ----------
-# report_data 用实例 ID 做 key，避免同名/同类型区域互相覆盖
-report_data = {}
+# ---------- 渲染单个楼层的完整编辑界面 ----------
+def render_floor(floor: dict, report_data: dict):
+    """渲染一个楼层的：删除入口 / 添加区域 / 已添加区域列表 / 打点标注 / 区域详情填写。
+    填写结果写入 report_data（instance_id -> report），供后面生成 JSON / PPT 使用。
+    """
+    top_col1, top_col2 = st.columns([5, 1])
+    top_col1.subheader(f"📐 {floor['name']}")
+    if top_col2.button("🗑️ 删除该楼层", key=f"del_floor_{floor['id']}"):
+        st.session_state["floors"] = [
+            f for f in st.session_state["floors"] if f["id"] != floor["id"]
+        ]
+        st.session_state["pending_active_floor"] = None
+        st.rerun()
 
-if not instances:
-    st.info("请先在左侧添加至少一个区域，下方将自动生成对应的填写面板。")
-else:
-    st.subheader("区域详情填写")
-    for inst in instances:
+    pil_image = Image.open(io.BytesIO(floor["image_bytes"]))
+    img_width, img_height = floor["image_width"], floor["image_height"]
+
+    # ---- 添加区域 ----
+    # expanded 只在这个 expander 第一次出现时生效（默认展开），之后用户手动收起/展开的
+    # 状态会通过 key 持久化，不会再被"添加了第一个区域"这种事情打断
+    with st.expander("➕ 添加区域", expanded=True, key=f"add_area_expander_{floor['id']}"):
+        form_version = floor["add_area_form_version"]
+        with st.form(f"add_area_form_{floor['id']}_{form_version}", clear_on_submit=True):
+            selected_type = st.selectbox(
+                "房间类型", options=ROOM_TYPE_OPTIONS, key=f"new_type_{floor['id']}_{form_version}"
+            )
+            custom_name = st.text_input(
+                "显示名称（可选，留空自动编号）",
+                placeholder="例如：厕所 A",
+                key=f"new_name_{floor['id']}_{form_version}",
+            )
+            submitted = st.form_submit_button("添加区域", use_container_width=True)
+            if submitted:
+                final_name = custom_name.strip() or generate_default_name(selected_type)
+                floor["instances"].append(
+                    {"id": uuid.uuid4().hex[:8], "type": selected_type, "name": final_name}
+                )
+                floor["add_area_form_version"] += 1
+                st.toast(f"已在「{floor['name']}」添加「{final_name}」")
+                st.rerun()
+
+    # ---- 已添加区域列表 ----
+    if floor["instances"]:
+        with st.expander(f"📋 已添加区域（{len(floor['instances'])} 个）", expanded=False):
+            for inst in list(floor["instances"]):
+                c1, c2 = st.columns([4, 1])
+                c1.write(f"📍 **{inst['name']}**　`{inst['type']}`")
+                if c2.button("🗑️", key=f"del_inst_{inst['id']}", help="删除该区域"):
+                    floor["instances"] = [i for i in floor["instances"] if i["id"] != inst["id"]]
+                    floor["coordinates"].pop(inst["id"], None)
+                    st.rerun()
+
+    st.markdown("---")
+
+    # ---- 打点标注 ----
+    st.markdown("**🗺️ 打点标注**")
+    st.caption(f"图纸「{floor['image_name']}」尺寸：{img_width} × {img_height} px。")
+
+    if not floor["instances"]:
+        # 还没有区域时，用同一个组件（streamlit_image_coordinates）显示图，
+        # 保证跟"已有区域"时的显示尺寸规则完全一致，不会出现切换时图片忽大忽小；
+        # 点击返回的坐标这里直接忽略，不记录、也不报错
+        streamlit_image_coordinates(pil_image, key=f"coords_preview_{floor['id']}")
+        st.info("请先在上方添加至少一个区域，才能开始为其记录坐标。")
+    else:
+        target_instance_id = st.selectbox(
+            "选择要标注的区域（点击下方图片即可为该区域记录坐标）",
+            options=[inst["id"] for inst in floor["instances"]],
+            format_func=lambda iid: next(
+                (i["name"] for i in floor["instances"] if i["id"] == iid), iid
+            ),
+            key=f"target_instance_{floor['id']}",
+        )
+        target_name = next(i["name"] for i in floor["instances"] if i["id"] == target_instance_id)
+        st.caption(f"点击图片为「{target_name}」记录坐标。")
+
+        coords = streamlit_image_coordinates(pil_image, key=f"coords_{floor['id']}")
+        if coords is not None:
+            sig = (coords["x"], coords["y"])
+            if st.session_state["last_click_sig"].get(floor["id"]) != sig:
+                st.session_state["last_click_sig"][floor["id"]] = sig
+                floor["coordinates"][target_instance_id] = {"x": coords["x"], "y": coords["y"]}
+                st.success(f"已记录「{target_name}」的坐标：({coords['x']}, {coords['y']})")
+
+        if floor["coordinates"]:
+            with st.expander("📌 本楼层已记录的坐标一览", expanded=False):
+                readable = {
+                    next((i["name"] for i in floor["instances"] if i["id"] == iid), iid): coord
+                    for iid, coord in floor["coordinates"].items()
+                }
+                st.json(readable)
+                if st.button("清空本楼层所有坐标", key=f"clear_coords_{floor['id']}"):
+                    floor["coordinates"] = {}
+                    st.session_state["last_click_sig"].pop(floor["id"], None)
+                    st.rerun()
+
+    st.markdown("---")
+
+    # ---- 区域详情填写 ----
+    if not floor["instances"]:
+        return
+
+    st.markdown("**📝 区域详情填写**")
+    for inst in floor["instances"]:
         instance_id = inst["id"]
         area_type = inst["type"]
         area_name = inst["name"]
 
         with st.expander(f"📍 {area_name}", expanded=True):
             checked_items = []
-            # 知识库里查不到该类型（自定义区域，或知识库以外的类型）就返回空列表，
-            # 折叠面板里只剩备注框和打点信息，不报错
             current_area_items = ROOM_KNOWLEDGE_BASE.get(area_type, [])
-
             if not current_area_items:
                 st.caption("（该区域无预设勾选项，可在下方直接填写备注）")
 
@@ -240,137 +235,303 @@ else:
             report_data[instance_id] = {
                 "名称": area_name,
                 "类型": area_type,
+                "楼层": floor["name"],
                 "已勾选项": checked_items,
                 "备注": note,
             }
 
-            # 把该区域记录的打点坐标合并进 report_data
-            if instance_id in st.session_state["area_coordinates"]:
-                coord = st.session_state["area_coordinates"][instance_id]
+            if instance_id in floor["coordinates"]:
+                coord = floor["coordinates"][instance_id]
                 report_data[instance_id]["坐标"] = coord
                 st.caption(f"📌 已标注坐标：({coord['x']}, {coord['y']})")
+
+
+# ---------- 1. 楼层标签页：已有楼层 + "添加新楼层" ----------
+# 注意：st.tabs 用了显式 key，Streamlit 规定"带 key 的组件一旦实例化，
+# 本次运行内后面的代码就不能再改它的 session_state"。所以"创建楼层后跳转到哪"
+# 不能在下面表单提交处直接赋值，只能先记到 pending_active_floor 这个中转变量里，
+# rerun 之后、st.tabs() 真正被调用之前，在这里统一写进它自己的 key
+if "pending_active_floor" in st.session_state:
+    st.session_state["floor_tabs"] = st.session_state.pop("pending_active_floor")
+
+floors = st.session_state["floors"]
+tab_labels = [f["name"] for f in floors] + ["➕ 添加新楼层"]
+tabs = st.tabs(tab_labels, key="floor_tabs", on_change="rerun")
+
+report_data = {}
+
+for i, floor in enumerate(floors):
+    with tabs[i]:
+        render_floor(floor, report_data)
+
+with tabs[-1]:
+    st.subheader("添加新楼层")
+    st.caption("每个楼层对应一张平面图，之后这一层的所有区域打点、生成 PPT 都只会用这张图。")
+    form_version = st.session_state["add_floor_form_version"]
+    with st.form(f"add_floor_form_{form_version}", clear_on_submit=True):
+        floor_name = st.text_input(
+            "楼层 / 页面名称", placeholder="例如：底楼、二楼", key=f"new_floor_name_{form_version}"
+        )
+        floor_image = st.file_uploader(
+            "上传该楼层的平面图", type=["png", "jpg", "jpeg"], key=f"new_floor_image_{form_version}"
+        )
+        submitted = st.form_submit_button("创建楼层", use_container_width=True)
+        if submitted:
+            if not floor_name.strip():
+                st.warning("请填写楼层名称。")
+            elif floor_image is None:
+                st.warning("请上传该楼层的平面图。")
+            else:
+                image_bytes = floor_image.getvalue()
+                pil_img = Image.open(io.BytesIO(image_bytes))
+                st.session_state["floors"].append(
+                    {
+                        "id": uuid.uuid4().hex[:8],
+                        "name": floor_name.strip(),
+                        "image_bytes": image_bytes,
+                        "image_name": floor_image.name,
+                        "image_width": pil_img.width,
+                        "image_height": pil_img.height,
+                        "instances": [],
+                        "coordinates": {},
+                        "add_area_form_version": 0,
+                    }
+                )
+                st.session_state["add_floor_form_version"] += 1
+                st.session_state["pending_active_floor"] = floor_name.strip()
+                st.toast(f"已创建楼层「{floor_name.strip()}」")
+                st.rerun()
 
 st.markdown("---")
 
 
-# ---------- PPTX 生成函数 ----------
-def build_pptx(
-    area_reports: list,
-    floor_plan_bytes: bytes = None,
-    img_width: int = None,
-    img_height: int = None,
-) -> bytes:
-    """遍历区域实例列表，为每个实例生成一页幻灯片：
-    左侧放文本内容（勾选项 + 备注），右侧放平面图，
-    如果该区域记录了打点坐标，就在图上对应位置画一个红色圆点。
-    幻灯片标题使用『显示名称』，同类型的多个实例（如厕所A/厕所B）会各自独立成页。
+# ---------- PPT 生成相关工具函数 ----------
+def add_arrowhead(connector, end="tail", arrow_type="triangle"):
+    """python-pptx 没有现成的箭头 API，手动往连接线的 <a:ln> 里插入箭头描述。"""
+    ln = connector.line._get_or_add_ln()
+    tag = qn("a:tailEnd") if end == "tail" else qn("a:headEnd")
+    for el in ln.findall(tag):
+        ln.remove(el)
+    el = ln.makeelement(tag, {"type": arrow_type, "w": "med", "len": "med"})
+    ln.append(el)
+
+
+def draw_marker(slide, center_x, center_y):
+    """无填充红边小正方形 + 中心极小红点。"""
+    square_size = Pt(14)
+    square = slide.shapes.add_shape(
+        MSO_SHAPE.RECTANGLE,
+        int(center_x - square_size / 2),
+        int(center_y - square_size / 2),
+        square_size,
+        square_size,
+    )
+    square.fill.background()
+    square.line.color.rgb = RGBColor(255, 0, 0)
+    square.line.width = Pt(1.5)
+    square.shadow.inherit = False
+
+    dot_size = Pt(3)
+    dot = slide.shapes.add_shape(
+        MSO_SHAPE.OVAL,
+        int(center_x - dot_size / 2),
+        int(center_y - dot_size / 2),
+        dot_size,
+        dot_size,
+    )
+    dot.fill.solid()
+    dot.fill.fore_color.rgb = RGBColor(255, 0, 0)
+    dot.line.fill.background()
+    dot.shadow.inherit = False
+
+
+def add_callout(slide, left, top, width, height, title, bullets):
+    """小号文字气泡：标题加粗下划线，内容"-"短横杠列点。
+    框的高度是外面按"这一侧一共几个区域"平均分配好固定传进来的，
+    这里打开 PowerPoint 原生的"自动缩小字体以适应形状"（TEXT_TO_FIT_SHAPE）：
+    内容一旦超出框高，PowerPoint 打开时会自动把字号按比例缩小，不会出现文字溢出框外。
+    （这个自动缩小是 PowerPoint 渲染时生效的，用 LibreOffice 等工具预览可能看不出缩小效果。）
+    """
+    box = slide.shapes.add_textbox(left, top, width, height)
+    tf = box.text_frame
+    tf.word_wrap = True
+    tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+    tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+    tf.margin_left = Pt(2)
+    tf.margin_right = Pt(2)
+    tf.margin_top = Pt(2)
+    tf.margin_bottom = Pt(2)
+
+    tf.text = title
+    title_p = tf.paragraphs[0]
+    title_p.font.bold = True
+    title_p.font.underline = True
+    title_p.font.size = Pt(11)
+
+    lines = list(bullets) if bullets else ["（未填写具体内容）"]
+    for line in lines:
+        p = tf.add_paragraph()
+        p.text = f"- {line}"
+        p.font.size = Pt(9.5)
+
+    return box
+
+
+def split_left_right(chunk_instances, coords_lookup, img_width, img_height):
+    """按标记点在图上的左右半边分配气泡，并在数量差距过大时做一次平衡。
+    没有坐标的区域按 0.5（中线）处理，参与平衡时优先被移动。
+    返回 (left_list, right_list)，每个元素是 (inst, x_ratio, y_ratio_or_None)。
+    """
+    items = []
+    for inst in chunk_instances:
+        coord = coords_lookup.get(inst["id"])
+        if coord:
+            x_ratio = coord["x"] / img_width
+            y_ratio = coord["y"] / img_height
+        else:
+            x_ratio, y_ratio = 0.5, None
+        items.append((inst, x_ratio, y_ratio))
+
+    left = [it for it in items if it[1] < 0.5]
+    right = [it for it in items if it[1] >= 0.5]
+
+    def move_closest_to_center(src, dst):
+        src.sort(key=lambda it: abs(it[1] - 0.5))
+        dst.append(src.pop(0))
+
+    while len(left) - len(right) > 1:
+        move_closest_to_center(left, right)
+    while len(right) - len(left) > 1:
+        move_closest_to_center(right, left)
+
+    # 有坐标的按纵向位置从上到下排；没坐标的（y_ratio=None）统一排在最后
+    left.sort(key=lambda it: (it[2] is None, it[2] if it[2] is not None else 0))
+    right.sort(key=lambda it: (it[2] is None, it[2] if it[2] is not None else 0))
+    return left, right
+
+
+def chunk_list(lst, size):
+    for i in range(0, len(lst), size):
+        yield lst[i : i + size]
+
+
+def build_pptx(floors: list, report_data: dict, max_per_page: int) -> bytes:
+    """按楼层出页：同一楼层的区域合并展示，图纸居中，每个区域变成一个小气泡
+    贴在图的左右两侧，用红色虚线肘形箭头指向它自己在图上的标记点。
+    单个楼层区域数超过 max_per_page 时自动拆成"楼层名 (1/2)"这样的续页。
     """
     prs = Presentation()
-    title_and_content_layout = prs.slide_layouts[1]
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
+    title_only_layout = prs.slide_layouts[5]
 
-    # 图片显示区域的边界框（幻灯片右侧），图片会按原始宽高比缩放后居中放入此框
-    IMG_BOX_LEFT = Inches(5.3)
-    IMG_BOX_TOP = Inches(1.6)
-    IMG_BOX_MAX_WIDTH = Inches(4.2)
-    IMG_BOX_MAX_HEIGHT = Inches(5.3)
+    CONTENT_TOP = Inches(1.3)
+    CONTENT_BOTTOM = Inches(7.0)
+    CALLOUT_WIDTH = Inches(2.6)
+    CALLOUT_GAP = Inches(0.3)
+    SIDE_MARGIN = Inches(0.3)
+    CALLOUT_VGAP = Inches(0.15)
 
-    for report in area_reports:
-        area_name = report.get("名称", "未命名区域")
-        checked_items = report.get("已勾选项", [])
-        note = report.get("备注", "").strip()
-        coord = report.get("坐标")
+    left_zone_right_edge = SIDE_MARGIN + CALLOUT_WIDTH
+    right_zone_left_edge = prs.slide_width - SIDE_MARGIN - CALLOUT_WIDTH
 
-        slide = prs.slides.add_slide(title_and_content_layout)
-        slide.shapes.title.text = area_name
+    img_max_left = left_zone_right_edge + CALLOUT_GAP
+    img_max_right = right_zone_left_edge - CALLOUT_GAP
+    img_max_width = img_max_right - img_max_left
+    img_max_height = CONTENT_BOTTOM - CONTENT_TOP
 
-        # ---- 左侧：文本框（勾选项 + 备注） ----
-        body_placeholder = slide.placeholders[1]
-        # 收窄正文占位符宽度，让内容保持在幻灯片左半边，给右侧图片留出空间
-        body_placeholder.left = Inches(0.5)
-        body_placeholder.top = Inches(1.6)
-        body_placeholder.width = Inches(4.5)
-        body_placeholder.height = Inches(5.3)
+    for floor in floors:
+        instances = floor["instances"]
+        if not instances:
+            continue
 
-        text_frame = body_placeholder.text_frame
-        text_frame.word_wrap = True
-        text_frame.clear()  # 清空默认占位文本
+        chunks = list(chunk_list(instances, max_per_page))
+        total_pages = len(chunks)
 
-        bullets_written = False
+        for page_idx, chunk in enumerate(chunks, start=1):
+            slide = prs.slides.add_slide(title_only_layout)
+            title_text = floor["name"] if total_pages == 1 else f"{floor['name']} ({page_idx}/{total_pages})"
+            title_shape = slide.shapes.title
+            title_shape.text = title_text
+            title_shape.left = Inches(0.4)
+            title_shape.top = Inches(0.25)
+            title_shape.width = prs.slide_width - Inches(0.8)
+            title_shape.height = Inches(0.8)
+            title_paragraph = title_shape.text_frame.paragraphs[0]
+            title_paragraph.font.size = Pt(28)
+            title_paragraph.alignment = PP_ALIGN.LEFT
 
-        # 已勾选项逐条作为项目符号写入
-        for item in checked_items:
-            if not bullets_written:
-                text_frame.text = item
-                bullets_written = True
-            else:
-                p = text_frame.add_paragraph()
-                p.text = item
-            text_frame.paragraphs[-1].level = 0
-
-        # 备注作为文本追加在下方（用低一级缩进区分）
-        if note:
-            if not bullets_written:
-                text_frame.text = f"备注：{note}"
-                bullets_written = True
-            else:
-                p = text_frame.add_paragraph()
-                p.text = f"备注：{note}"
-                p.level = 1
-
-        # 如果既没有勾选项也没有备注，避免留空白正文
-        if not bullets_written:
-            text_frame.text = "（未填写具体内容）"
-
-        # ---- 右侧：平面图 + 打点标记 ----
-        if floor_plan_bytes and img_width and img_height:
-            aspect = img_width / img_height
-            box_aspect = IMG_BOX_MAX_WIDTH / IMG_BOX_MAX_HEIGHT
-
+            # ---- 居中放置该楼层的图纸 ----
+            aspect = floor["image_width"] / floor["image_height"]
+            box_aspect = img_max_width / img_max_height
             if aspect > box_aspect:
-                # 图片相对更“宽”，以边界框宽度为约束
-                final_width = IMG_BOX_MAX_WIDTH
+                final_width = img_max_width
                 final_height = int(final_width / aspect)
             else:
-                # 图片相对更“高”，以边界框高度为约束
-                final_height = IMG_BOX_MAX_HEIGHT
+                final_height = img_max_height
                 final_width = int(final_height * aspect)
 
-            # 图片在边界框内居中放置
-            pic_left = IMG_BOX_LEFT + int((IMG_BOX_MAX_WIDTH - final_width) / 2)
-            pic_top = IMG_BOX_TOP + int((IMG_BOX_MAX_HEIGHT - final_height) / 2)
+            pic_left = img_max_left + int((img_max_width - final_width) / 2)
+            pic_top = CONTENT_TOP + int((img_max_height - final_height) / 2)
 
-            # 每张幻灯片都需要一个独立的字节流（BytesIO 读取后指针会移动）
-            image_stream = io.BytesIO(floor_plan_bytes)
             picture = slide.shapes.add_picture(
-                image_stream,
+                io.BytesIO(floor["image_bytes"]),
                 left=pic_left,
                 top=pic_top,
                 width=final_width,
                 height=final_height,
             )
 
-            # ---- 坐标几何换算：像素坐标 -> 比例 -> PPT 绝对位置 ----
-            if coord:
-                x_ratio = coord["x"] / coord["width"]
-                y_ratio = coord["y"] / coord["height"]
+            # ---- 分配左右两侧气泡 ----
+            left_items, right_items = split_left_right(
+                chunk, floor["coordinates"], floor["image_width"], floor["image_height"]
+            )
 
-                # 用图片在 PPT 中的实际 left/top/width/height（来自 picture 对象本身，
-                # 避免自己心算产生偏差）换算出打点的绝对位置
-                dot_center_x = picture.left + int(picture.width * x_ratio)
-                dot_center_y = picture.top + int(picture.height * y_ratio)
+            def render_side(items, side_left_x, anchor="left"):
+                if not items:
+                    return
+                # 把这一侧的可用纵向空间，按区域个数平均分配成等高的框——
+                # 不再靠字符数瞎猜高度，配合 add_callout 里打开的自动缩字，
+                # 内容多的框会自动缩小字号塞进去，不会溢出、也不会互相重叠
+                n = len(items)
+                available_height = CONTENT_BOTTOM - CONTENT_TOP
+                box_height = int((available_height - CALLOUT_VGAP * (n - 1)) / n)
 
-                dot_size = Pt(14)
-                marker = slide.shapes.add_shape(
-                    MSO_SHAPE.OVAL,
-                    int(dot_center_x - dot_size / 2),
-                    int(dot_center_y - dot_size / 2),
-                    dot_size,
-                    dot_size,
-                )
-                marker.fill.solid()
-                marker.fill.fore_color.rgb = RGBColor(255, 0, 0)
-                marker.line.color.rgb = RGBColor(255, 0, 0)
-                marker.shadow.inherit = False
+                current_top = CONTENT_TOP
+                for inst, x_ratio, y_ratio in items:
+                    report = report_data.get(inst["id"], {})
+                    area_name = report.get("名称", inst["name"])
+                    checked_items = report.get("已勾选项", [])
+                    note = report.get("备注", "").strip()
+                    bullets = list(checked_items)
+                    if note:
+                        # 备注按用户实际换行拆开，每一行单独变成一条"- "列点
+                        bullets.extend(line.strip() for line in note.splitlines() if line.strip())
+
+                    box = add_callout(
+                        slide, side_left_x, current_top, CALLOUT_WIDTH, box_height, area_name, bullets
+                    )
+
+                    coord = floor["coordinates"].get(inst["id"])
+                    if coord is not None:
+                        marker_x = picture.left + int(picture.width * (coord["x"] / floor["image_width"]))
+                        marker_y = picture.top + int(picture.height * (coord["y"] / floor["image_height"]))
+                        draw_marker(slide, marker_x, marker_y)
+
+                        begin_y = box.top + int(box.height / 2)
+                        begin_x = (box.left + box.width) if anchor == "left" else box.left
+                        connector = slide.shapes.add_connector(
+                            MSO_CONNECTOR.ELBOW, begin_x, begin_y, marker_x, marker_y
+                        )
+                        connector.line.color.rgb = RGBColor(255, 0, 0)
+                        connector.line.width = Pt(1)
+                        connector.line.dash_style = MSO_LINE_DASH_STYLE.DASH
+                        add_arrowhead(connector, end="tail", arrow_type="triangle")
+
+                    current_top = current_top + box_height + CALLOUT_VGAP
+
+            render_side(left_items, SIDE_MARGIN, anchor="left")
+            render_side(right_items, right_zone_left_edge, anchor="right")
 
     buffer = io.BytesIO()
     prs.save(buffer)
@@ -378,18 +539,43 @@ def build_pptx(
     return buffer.getvalue()
 
 
-# ---------- 4. 生成 JSON 数据 / PPT 文件 ----------
-col1, col2 = st.columns(2)
+# ---------- 2. 生成 JSON 数据 / PPT 文件 ----------
+st.subheader("📤 生成报告")
 
-# 按实例添加顺序整理成列表（而不是用不透明的 UUID 做 key 展示给用户）
-ordered_reports = [report_data[inst["id"]] for inst in instances if inst["id"] in report_data]
+max_per_page = st.number_input(
+    "每页 PPT 最多显示多少个区域（超过自动拆成续页）",
+    min_value=2,
+    max_value=12,
+    value=6,
+    step=1,
+)
+
+ordered_reports = []
+for floor in floors:
+    for inst in floor["instances"]:
+        if inst["id"] in report_data:
+            ordered_reports.append(report_data[inst["id"]])
+
+col1, col2 = st.columns(2)
 
 with col1:
     if st.button("生成 JSON 数据", type="primary", use_container_width=True):
-        if not instances:
-            st.warning("尚未添加任何区域，无法生成报告。")
+        if not floors:
+            st.warning("尚未添加任何楼层，无法生成报告。")
         else:
-            final_output = {"区域列表": ordered_reports}
+            final_output = {
+                "楼层列表": [
+                    {
+                        "楼层名称": floor["name"],
+                        "区域列表": [
+                            report_data[inst["id"]]
+                            for inst in floor["instances"]
+                            if inst["id"] in report_data
+                        ],
+                    }
+                    for floor in floors
+                ]
+            }
             st.success("JSON 数据生成成功！")
             st.json(final_output)
 
@@ -403,15 +589,12 @@ with col1:
 
 with col2:
     if st.button("生成 PPT", type="secondary", use_container_width=True):
-        if not instances:
-            st.warning("尚未添加任何区域，无法生成报告。")
+        if not floors:
+            st.warning("尚未添加任何楼层，无法生成报告。")
+        elif not any(floor["instances"] for floor in floors):
+            st.warning("所有楼层都还没有添加区域，无法生成报告。")
         else:
-            pptx_bytes = build_pptx(
-                ordered_reports,
-                floor_plan_bytes=floor_plan_bytes,
-                img_width=img_width,
-                img_height=img_height,
-            )
+            pptx_bytes = build_pptx(floors, report_data, int(max_per_page))
             st.success("PPT 生成成功！")
             st.download_button(
                 label="下载 PPTX 文件",
